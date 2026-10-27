@@ -1,0 +1,998 @@
+---
+title: "Calibrating self-reported BMI in national surveillance: analysis code"
+subtitle: "IAN-AF 2015–2016, Portugal"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+This document contains the complete code for the analyses reported in the paper. It runs from the
+IAN-AF 2015–2016 individual data (adults, with self-reported and measured height and weight), which
+are not distributed with this repository; access can be requested from the IAN-AF consortium
+(https://www.ian-af.up.pt/en/).
+
+To reproduce the analyses, save the data file as `data/ianaf_adults.csv` (or point the environment
+variable `PAPER5_DATA` to it) and render this document with Quarto. All tables are written to
+`outputs/`. The sensitivity analysis with education in the calibration equations is obtained by
+rendering with `PAPER5_EDU=1` and `PAPER5_OUT=outputs_with_edu`.
+
+
+
+```{r setup}
+rm(list = ls(all.names = TRUE))
+set.seed(123)
+
+pkgs <- c("dplyr", "tidyr", "survey", "mice", "ggplot2", "patchwork",
+          "flextable", "officer")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}
+# svyVGAM is only needed for Table 1 (survey-weighted multinomial models)
+HAS_SVYVGAM <- requireNamespace("svyVGAM", quietly = TRUE)
+if (HAS_SVYVGAM) suppressPackageStartupMessages(library(svyVGAM))
+
+options(survey.lonely.psu = "adjust")
+
+# ---- Settings ------------------------------------------------------------
+DATA_FILE   <- Sys.getenv("PAPER5_DATA", "data/ianaf_adults.csv")
+OUT_DIR     <- Sys.getenv("PAPER5_OUT",  "outputs")
+N_BOOT      <- 500   # bootstrap replicates for differences between BMI methods
+N_IMP       <- 20    # multiple imputations
+N_SPLITS    <- 200   # repeated 70/30 splits (stability of the validation)
+# Sensitivity analysis: exclude pairs with implausible self-report discrepancies
+DISCREPANCY_LIMITS <- c(height_cm = 10, weight_kg = 15)
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+save_csv <- function(x, name) write.csv(x, file.path(OUT_DIR, paste0(name, ".csv")), row.names = FALSE)
+```
+
+# 1. Data preparation
+
+```{r data}
+raw <- read.csv(DATA_FILE, check.names = FALSE)
+
+# Standardise variable names with janitor::clean_names()
+if (requireNamespace("janitor", quietly = TRUE)) {
+  raw <- janitor::clean_names(raw)
+} else {
+  snake <- function(x) {
+    x <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", x)
+    x <- gsub("[^a-z0-9]+", "_", tolower(x))
+    gsub("^_|_$", "", x)
+  }
+  names(raw) <- snake(names(raw))
+}
+names(raw)[names(raw) %in% c("", "x", "v1")] <- "v1"
+if ("ipaqlevel" %in% names(raw)) raw <- rename(raw, ipa_qlevel = ipaqlevel)
+
+ian <- raw %>%
+  mutate(
+    psu2 = nut + 0.01 * uf,
+    nut2 = nut,
+    peso_rep   = ifelse(peso_rep   %in% c(888.8, 999.9), NA, peso_rep),
+    peso_med   = ifelse(peso_med   %in% c(777.7, 999.9), NA, peso_med),
+    altura_rep = ifelse(altura_rep %in% c(888.8, 999.9), NA, altura_rep),
+    altura_med = ifelse(altura_med %in% c(777.7, 999.9), NA, altura_med),
+    escol_prop = ifelse(escol_prop == 8, NA, escol_prop),
+    rend       = ifelse(rend == 88, NA, rend),
+    trab       = ifelse(trab %in% c(4, 8, 9), NA, trab)
+  )
+
+flow <- tibble(
+  step = c("Total participants", "Non-pregnant", "Aged >= 18 years",
+           "Complete self-reported and measured anthropometry"),
+  n = c(nrow(ian),
+        sum(ian$ind_gravida == 0),
+        sum(ian$ind_gravida == 0 & ian$idade >= 18),
+        sum(ian$ind_gravida == 0 & ian$idade >= 18 &
+              !is.na(ian$peso_rep) & !is.na(ian$peso_med) &
+              !is.na(ian$altura_rep) & !is.na(ian$altura_med)))
+)
+flow
+
+dat <- ian %>%
+  filter(ind_gravida == 0, idade >= 18,
+         !is.na(peso_rep), !is.na(peso_med), !is.na(altura_rep), !is.na(altura_med)) %>%
+  mutate(
+    sexo = factor(sexo, levels = c(0, 1), labels = c("Female", "Male")),
+    region = factor(nut2, levels = 1:7,
+                    labels = c("North", "Center", "Lisbon M.A.", "Alentejo",
+                               "Algarve", "A.R. Madeira", "A.R. Azores")),
+    edu_rec = factor(case_when(
+      escol_prop %in% 0:3 ~ "Low",            # up to 9th grade
+      escol_prop %in% 4:5 ~ "Intermediate",   # 12th grade / post-secondary
+      escol_prop == 6     ~ "High"),          # higher education
+      levels = c("High", "Intermediate", "Low")),
+    rend_rec = factor(case_when(
+      rend %in% 1:2  ~ "Low",
+      rend %in% 3:4  ~ "Intermediate",
+      rend %in% 5:10 ~ "High"),
+      levels = c("High", "Intermediate", "Low")),
+    trab = factor(trab, levels = c(1, 2, 3),
+                  labels = c("Employed", "Unemployed", "Other")),
+    est_civ = factor(est_civ, levels = 1:4,
+                     labels = c("Single", "Divorced", "Widowed", "Married/union")),
+    # Anthropometry: biological plausibility limits only (no IQR deletion)
+    plausible = between(altura_med, 120, 220) & between(altura_rep, 120, 220) &
+                between(peso_med, 30, 250)    & between(peso_rep, 30, 250),
+    bmi_med = peso_med / (altura_med / 100)^2,
+    bmi_rep = peso_rep / (altura_rep / 100)^2,      # self-reported weight AND height
+    alt_dif = altura_rep - altura_med,
+    peso_dif = peso_rep - peso_med,
+    bmi_dif = bmi_rep - bmi_med,
+    altura_avg = (altura_rep + altura_med) / 2,
+    peso_avg = (peso_rep + peso_med) / 2,
+    bmi_avg = (bmi_rep + bmi_med) / 2,
+    # complete case for the covariates used in the paper
+    cc = !is.na(edu_rec) & !is.na(rend_rec) & !is.na(trab) & plausible,
+    big_discrepancy = abs(alt_dif) > DISCREPANCY_LIMITS["height_cm"] |
+                      abs(peso_dif) > DISCREPANCY_LIMITS["weight_kg"]
+  )
+
+bmi_cat <- function(b) factor(case_when(b < 25 ~ "Normal", b < 30 ~ "Pre-obesity",
+                                        b >= 30 ~ "Obesity"),        # NA stays NA
+                              levels = c("Normal", "Pre-obesity", "Obesity"))
+
+dat <- dat %>% mutate(bmi_med_cat = bmi_cat(bmi_med), bmi_rep_cat = bmi_cat(bmi_rep))
+
+cat("Analytic sample:", nrow(dat), "| implausible values:", sum(!dat$plausible),
+    "| complete cases:", sum(dat$cc),
+    "| large self-report discrepancies (sensitivity):", sum(dat$big_discrepancy), "\n")
+table(dat$sexo, dat$cc)
+
+# Full design: estimates for sex / complete-case groups are domain estimates
+make_design <- function(d) svydesign(id = ~psu2, strata = ~nut2, weights = ~ponderador1,
+                                     nest = TRUE, data = d)
+des_all <- make_design(dat)
+dom <- function(design, sx, extra = TRUE) {
+  design$variables$.keep <- design$variables$cc & design$variables$sexo == sx & extra
+  subset(design, .keep)
+}
+SEXES <- c(Women = "Female", Men = "Male")
+# add / overwrite a variable inside a design (avoids get() inside update/subset)
+setvar <- function(design, name, value) { design$variables[[name]] <- value; design }
+n_dom <- function(design) sum(weights(design) > 0)
+```
+
+# 2. Descriptives (Table S13, Table S1, Table S3)
+
+```{r descriptives}
+wprop <- function(design, var) {
+  f <- as.formula(paste0("~", var))
+  m <- svymean(f, design, na.rm = TRUE)
+  tibble(level = sub(var, "", names(coef(m))), pct = round(100 * coef(m), 1))
+}
+wmean <- function(design, var) {
+  f <- as.formula(paste0("~", var))
+  m <- svymean(f, design, na.rm = TRUE); v <- svyvar(f, design, na.rm = TRUE)
+  sprintf("%.1f (%.1f)", coef(m), sqrt(coef(v)))
+}
+table1 <- lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab])
+  bind_rows(
+    tibble(variable = "Age, mean (SD)", level = "", value = wmean(d, "idade")),
+    bind_rows(lapply(c("region", "edu_rec", "trab", "rend_rec"), function(v)
+      wprop(d, v) %>% mutate(variable = v, value = paste0(pct, "%")) %>% select(-pct))),
+    tibble(variable = c("Weight self-reported", "Weight measured", "Height self-reported",
+                        "Height measured", "BMI self-reported", "BMI measured"),
+           level = "mean (SD)",
+           value = sapply(c("peso_rep", "peso_med", "altura_rep", "altura_med",
+                            "bmi_rep", "bmi_med"), function(v) wmean(d, v)))
+  ) %>% mutate(sex = lab)
+}) %>% bind_rows() %>%
+  pivot_wider(names_from = sex, values_from = value)
+table1
+save_csv(table1, "Table1_weighted_descriptives")
+save_csv(tibble(sex = names(SEXES),
+                n_unweighted = sapply(SEXES, function(s) sum(dat$cc & dat$sexo == s)),
+                pop_weighted = sapply(SEXES, function(s) round(sum(dat$ponderador1[dat$cc & dat$sexo == s])))),
+         "Table1_sample_size")
+
+# Table S1: complete vs incomplete cases (unweighted, among the analytic sample)
+tableS1 <- dat %>%
+  mutate(group = ifelse(cc, "Complete", "Incomplete")) %>%
+  group_by(group) %>%
+  summarise(n = n(), age_mean = round(mean(idade), 1), age_sd = round(sd(idade), 1),
+            women_pct = round(100 * mean(sexo == "Female"), 1),
+            high_edu_pct = round(100 * mean(edu_rec == "High", na.rm = TRUE), 1),
+            employed_pct = round(100 * mean(trab == "Employed", na.rm = TRUE), 1),
+            .groups = "drop")
+tableS1
+save_csv(tableS1, "TableS1_complete_vs_incomplete")
+```
+
+# 3. Magnitude of reporting bias (Tables S4–S5, Bland–Altman, LOESS)
+
+```{r bias-magnitude}
+bias_by_group <- function(diff_var, sx) {
+  d <- dom(des_all, sx)
+  d <- update(d, bmi_med_cat = bmi_med_cat)
+  covs <- c(age_group = "age_grp", region = "region", education = "edu_rec",
+            income = "rend_rec", employment = "trab", bmi = "bmi_med_cat")
+  d <- update(d, age_grp = cut(idade, c(17, 29, 39, 49, 59, 69, 79, Inf),
+                               labels = c("18-29", "30-39", "40-49", "50-59",
+                                          "60-69", "70-79", ">=80")))
+  bind_rows(lapply(names(covs), function(lab) {
+    v <- covs[[lab]]
+    est <- svyby(as.formula(paste0("~", diff_var)), as.formula(paste0("~", v)), d,
+                 svymean, na.rm = TRUE)
+    fit <- svyglm(as.formula(paste0(diff_var, " ~ ", v)), d)
+    tibble(covariate = lab, category = as.character(est[[v]]),
+           mean_diff = round(est[[diff_var]], 2), se = round(SE(est), 2),
+           p_between = signif(regTermTest(fit, v)$p, 3))
+  })) %>% mutate(sex = sx, outcome = diff_var)
+}
+tableS4_S5 <- bind_rows(lapply(SEXES, function(s)
+  bind_rows(bias_by_group("alt_dif", s), bias_by_group("peso_dif", s), bias_by_group("bmi_dif", s))))
+save_csv(tableS4_S5, "TableS4_S5_bias_by_group")
+
+# Overall weighted mean bias and Bland–Altman limits of agreement
+ba <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab])
+  bind_rows(lapply(c(height = "alt_dif", weight = "peso_dif", bmi = "bmi_dif"), function(v) {
+    m <- svymean(as.formula(paste0("~", v)), d)
+    sdv <- sqrt(coef(svyvar(as.formula(paste0("~", v)), d)))
+    # proportional bias: regression of the difference on the mean of both methods
+    avg <- switch(v, alt_dif = "altura_avg", peso_dif = "peso_avg", bmi_dif = "bmi_avg")
+    pb <- svyglm(as.formula(paste0(v, " ~ ", avg)), d)
+    m <- c(est = as.numeric(coef(m)), se = as.numeric(SE(m))); sdv <- as.numeric(sdv)
+    tibble(sex = lab, measure = v, mean_diff = m[["est"]], se = m[["se"]],
+           ci_low = m[["est"]] - 1.96 * m[["se"]], ci_high = m[["est"]] + 1.96 * m[["se"]],
+           loa_low = m[["est"]] - 1.96 * sdv, loa_high = m[["est"]] + 1.96 * sdv,
+           prop_bias_slope = coef(pb)[2], prop_bias_p = summary(pb)$coefficients[2, 4])
+  }))
+})) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+ba
+save_csv(ba, "Bland_Altman_weighted")
+
+ba_plot <- function(sx, meas, lab) {
+  d <- dat %>% filter(cc, sexo == sx) %>%
+    mutate(avg = (.data[[paste0(meas, "_rep")]] + .data[[paste0(meas, "_med")]]) / 2,
+           dif = .data[[paste0(meas, "_rep")]] - .data[[paste0(meas, "_med")]])
+  s <- ba %>% filter(sex == names(SEXES)[SEXES == sx],
+                     measure == c(altura = "alt_dif", peso = "peso_dif")[meas])
+  ggplot(d, aes(avg, dif)) +
+    geom_point(alpha = 0.35, size = 0.8) +
+    geom_hline(yintercept = 0, colour = "grey50") +
+    geom_hline(yintercept = s$mean_diff, colour = "navy") +
+    geom_hline(yintercept = c(s$loa_low, s$loa_high), colour = "firebrick", linetype = "dashed") +
+    labs(x = paste("Mean of self-reported and measured", lab),
+         y = "Self-reported − measured", title = paste(lab, "–", names(SEXES)[SEXES == sx])) +
+    theme_classic()
+}
+fig_ba <- (ba_plot("Female", "peso", "weight (kg)") | ba_plot("Male", "peso", "weight (kg)")) /
+          (ba_plot("Female", "altura", "height (cm)") | ba_plot("Male", "altura", "height (cm)"))
+ggsave(file.path(OUT_DIR, "Figure_Bland_Altman.png"), fig_ba, width = 10, height = 9, dpi = 300, bg = "white")
+
+# Age trends (survey-weighted LOESS)
+loess_plot <- function(var, ylab) {
+  ggplot(dat %>% filter(cc), aes(idade, .data[[var]], weight = ponderador1, colour = sexo)) +
+    geom_smooth(method = "loess", span = 1, se = TRUE) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    labs(x = "Age (years)", y = ylab, colour = NULL) + theme_minimal()
+}
+fig_loess <- loess_plot("alt_dif", "Height bias (cm)") / loess_plot("peso_dif", "Weight bias (kg)") /
+             loess_plot("bmi_dif", "BMI bias (kg/m²)")
+ggsave(file.path(OUT_DIR, "Figure_age_bias_loess.png"), fig_loess, width = 7, height = 10, dpi = 300, bg = "white")
+```
+
+# 4. Determinants of misreporting (Table 1 and Table S6)
+
+```{r determinants}
+reconstruct_last <- function(cf, vc, prefix, k) {
+  idx <- grep(paste0("^", prefix, ".*:", k, "$"), names(cf))
+  est <- -sum(cf[idx]); se <- sqrt(sum(vc[idx, idx]))
+  c(est = est, se = se)
+}
+run_multinom <- function(outcome, h_thr, w_thr, sx) {
+  d <- dat %>% mutate(
+    y = case_when(
+      outcome == "height" & abs(alt_dif)  <= h_thr ~ "ref",
+      outcome == "height" & alt_dif  < -h_thr ~ "underreport",
+      outcome == "height" & alt_dif  >  h_thr ~ "overreport",
+      outcome == "weight" & abs(peso_dif) <= w_thr ~ "ref",
+      outcome == "weight" & peso_dif < -w_thr ~ "underreport",
+      outcome == "weight" & peso_dif >  w_thr ~ "overreport"),
+    y = factor(y, levels = c("ref", "underreport", "overreport")),
+    region_e = region)
+  contrasts(d$region_e) <- contr.sum(7)
+  des <- make_design(d)
+  des <- subset(des, cc & sexo == sx)
+  fit <- svy_vglm(y ~ idade + region_e + edu_rec + rend_rec + trab + bmi_med_cat,
+                  design = des, family = VGAM::multinomial(refLevel = "ref"))
+  cf <- coef(fit); vc <- vcov(fit)
+  res <- tibble(term = names(cf), est = cf, se = sqrt(diag(vc)))
+  for (k in 1:2) {
+    r <- reconstruct_last(cf, vc, "region_e", k)
+    res <- bind_rows(res, tibble(term = paste0("region_e7:", k), est = r["est"], se = r["se"]))
+  }
+  res %>% filter(!grepl("Intercept", term)) %>%
+    mutate(comparison = ifelse(grepl(":1$", term), "Underreport vs no bias", "Overreport vs no bias"),
+           term = sub(":[12]$", "", term),
+           term = sub("region_e([1-7])", "region_\\1", term),
+           OR = exp(est), lo = exp(est - 1.96 * se), hi = exp(est + 1.96 * se),
+           p = 2 * pnorm(-abs(est / se)),
+           `OR (95% CI)` = sprintf("%.2f (%.2f–%.2f)", OR, lo, hi),
+           sex = sx, outcome = outcome)
+}
+if (HAS_SVYVGAM) {
+  table2 <- bind_rows(lapply(SEXES, function(s) bind_rows(
+    run_multinom("height", 0.5, 1, s), run_multinom("weight", 0.5, 1, s))))
+  tableS3 <- bind_rows(lapply(SEXES, function(s) bind_rows(
+    run_multinom("height", 1, 2, s), run_multinom("weight", 1, 2, s))))
+  # region_1..region_7 = North, Center, Lisbon, Alentejo, Algarve, Madeira, Azores (vs overall mean)
+  save_csv(table2, "Table2_multinomial_0.5cm_1kg")
+  save_csv(tableS3, "TableS3_multinomial_1cm_2kg")
+} else message("svyVGAM not installed: Table 1 / Table S6 skipped")
+```
+
+# 5. Calibration equations
+
+## 5.1 Backward selection (Wald tests, p < 0.05)
+
+```{r selection}
+backward <- function(design, outcome, rep_var, candidates, alpha = 0.05) {
+  current <- candidates; steps <- list()
+  repeat {
+    f <- as.formula(paste(outcome, "~", paste(c(rep_var, current), collapse = " + ")))
+    fit <- svyglm(f, design)
+    p <- sapply(current, function(v) regTermTest(fit, v)$p)
+    steps[[length(steps) + 1]] <- tibble(step = length(steps) + 1, term = current,
+                                         p = signif(as.numeric(p), 3))
+    if (max(p) < alpha || length(current) == 0) break
+    current <- current[-which.max(p)]
+  }
+  list(selected = current, steps = bind_rows(steps), fit = fit)
+}
+CANDIDATES <- c("idade", "region", "edu_rec", "rend_rec", "trab")
+selection <- list()
+for (lab in names(SEXES)) {
+  d <- dom(des_all, SEXES[lab])
+  selection[[paste(lab, "weight")]] <- backward(d, "peso_med", "peso_rep", CANDIDATES)
+  selection[[paste(lab, "height")]] <- backward(d, "altura_med", "altura_rep", CANDIDATES)
+}
+sel_table <- bind_rows(lapply(names(selection), function(n)
+  selection[[n]]$steps %>% mutate(model = n)))
+sel_summary <- tibble(model = names(selection),
+                      selected = sapply(selection, function(x) paste(x$selected, collapse = ", ")))
+sel_summary
+save_csv(sel_table, "Calibration_backward_selection_steps")
+save_csv(sel_summary, "Calibration_backward_selection_result")
+```
+
+## 5.2 Final models
+
+The main models use age and region only (common set for both sexes and both outcomes).
+Education was retained by backward selection in two of the four models but did not improve
+prediction or classification and inflated relative educational inequalities, so equations
+with education are a sensitivity analysis (Supplementary Table S8). To reproduce Table S8,
+render with the environment variables `PAPER5_EDU=1` and `PAPER5_OUT=outputs_with_edu`.
+
+```{r calibration}
+FINAL_COVARS <- if (Sys.getenv("PAPER5_EDU", "0") == "1") c("idade", "region", "edu_rec") else c("idade", "region")
+
+calib_models <- list()
+for (lab in names(SEXES)) {
+  d <- dom(des_all, SEXES[lab])
+  calib_models[[lab]] <- list(
+    weight = svyglm(as.formula(paste("peso_med ~ peso_rep +", paste(FINAL_COVARS, collapse = " + "))), d),
+    height = svyglm(as.formula(paste("altura_med ~ altura_rep +", paste(FINAL_COVARS, collapse = " + "))), d))
+}
+apply_calibration <- function(df, models) {
+  df$peso_cal <- NA_real_; df$altura_cal <- NA_real_
+  for (lab in names(SEXES)) {
+    i <- which(df$sexo == SEXES[lab] & complete.cases(df[, c("peso_rep", "altura_rep", FINAL_COVARS)]))
+    df$peso_cal[i]   <- predict(models[[lab]]$weight, newdata = df[i, ], type = "response")
+    df$altura_cal[i] <- predict(models[[lab]]$height, newdata = df[i, ], type = "response")
+  }
+  df %>% mutate(bmi_cal = peso_cal / (altura_cal / 100)^2, bmi_cal_cat = bmi_cat(bmi_cal))
+}
+dat <- apply_calibration(dat, calib_models)
+des_all <- make_design(dat)
+
+tableS6 <- bind_rows(lapply(names(SEXES), function(lab) bind_rows(lapply(c("weight", "height"), function(o) {
+  m <- calib_models[[lab]][[o]]; ci <- confint(m)
+  tibble(sex = lab, outcome = o, term = names(coef(m)),
+         `Coefficient (95% CI)` = sprintf("%.3f (%.3f to %.3f)", coef(m), ci[, 1], ci[, 2]))
+}))))
+tableS6
+save_csv(tableS6, "TableS6_calibration_coefficients")
+
+# Extra predictors tested (smoking, physical activity, marital status): change in fit
+extra_check <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab], extra = !is.na(dat$fum_fuma_atual_adulto) &
+                                         !is.na(dat$ipa_qlevel) & !is.na(dat$est_civ))
+  bind_rows(lapply(c(weight = "peso", height = "altura"), function(v) {
+    base <- svyglm(as.formula(paste0(v, "_med ~ ", v, "_rep + ", paste(FINAL_COVARS, collapse = " + "))), d)
+    ext  <- update(base, . ~ . + factor(fum_fuma_atual_adulto) + factor(ipa_qlevel) + est_civ)
+    rmse <- function(m) sqrt(sum(m$prior.weights * residuals(m, type = "response")^2) / sum(m$prior.weights))
+    tibble(sex = lab, outcome = v, n = n_dom(d),
+           rmse_final = rmse(base), rmse_extended = rmse(ext),
+           p_extra_terms = as.numeric(regTermTest(ext, ~ factor(fum_fuma_atual_adulto) + factor(ipa_qlevel) + est_civ)$p))
+  }))
+})) %>% mutate(across(where(is.numeric), ~ signif(.x, 4)))
+extra_check
+save_csv(extra_check, "Calibration_extra_predictors_check")
+```
+
+## 5.3 Split-sample internal validation (70/30) of the height and weight equations
+
+```{r validation}
+validate_once <- function(seed) {
+  set.seed(seed)
+  d <- dat %>% filter(cc)
+  d$split <- ifelse(runif(nrow(d)) < 0.7, "train", "test")
+  out <- list()
+  for (lab in names(SEXES)) {
+    tr <- make_design(d %>% filter(sexo == SEXES[lab], split == "train"))
+    mw <- svyglm(as.formula(paste("peso_med ~ peso_rep +", paste(FINAL_COVARS, collapse = " + "))), tr)
+    mh <- svyglm(as.formula(paste("altura_med ~ altura_rep +", paste(FINAL_COVARS, collapse = " + "))), tr)
+    te <- d %>% filter(sexo == SEXES[lab], split == "test")
+    te$bmi_cal_v <- predict(mw, newdata = te, type = "response") /
+                    (predict(mh, newdata = te, type = "response") / 100)^2
+    w <- te$ponderador1
+    slope_fit <- lm(bmi_med ~ bmi_cal_v, data = te, weights = w)
+    ob_m <- te$bmi_med >= 30; ob_c <- te$bmi_cal_v >= 30; ob_r <- te$bmi_rep >= 30
+    out[[lab]] <- tibble(
+      sex = lab, n_test = nrow(te),
+      citl_cal = weighted.mean(te$bmi_med - te$bmi_cal_v, w),
+      citl_rep = weighted.mean(te$bmi_med - te$bmi_rep, w),
+      slope_cal = coef(slope_fit)[2],
+      slope_rep = coef(lm(bmi_med ~ bmi_rep, data = te, weights = w))[2],
+      mae_cal = weighted.mean(abs(te$bmi_med - te$bmi_cal_v), w),
+      mae_rep = weighted.mean(abs(te$bmi_med - te$bmi_rep), w),
+      rmse_cal = sqrt(weighted.mean((te$bmi_med - te$bmi_cal_v)^2, w)),
+      rmse_rep = sqrt(weighted.mean((te$bmi_med - te$bmi_rep)^2, w)),
+      sens_obesity_cal = sum(w[ob_m & ob_c]) / sum(w[ob_m]),
+      sens_obesity_rep = sum(w[ob_m & ob_r]) / sum(w[ob_m]),
+      spec_obesity_cal = sum(w[!ob_m & !ob_c]) / sum(w[!ob_m]),
+      spec_obesity_rep = sum(w[!ob_m & !ob_r]) / sum(w[!ob_m]))
+  }
+  bind_rows(out)
+}
+validation_main <- validate_once(123)                     # the reported 70/30 split
+validation_rep  <- bind_rows(lapply(1:N_SPLITS, validate_once)) %>%  # stability over splits
+  group_by(sex) %>%
+  summarise(across(-n_test, list(mean = mean, p2.5 = ~ quantile(.x, .025), p97.5 = ~ quantile(.x, .975))),
+            .groups = "drop")
+validation_main %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+save_csv(validation_main %>% mutate(across(where(is.numeric), ~ round(.x, 3))), "Validation_70_30")
+save_csv(validation_rep %>% mutate(across(where(is.numeric), ~ round(.x, 3))), "Validation_70_30_repeated")
+```
+
+## 5.4 Additional candidate predictors
+
+Candidates that are available in self-reported surveys and do not depend on measurement:
+non-linear terms (age², self-reported value², self-reported × age), self-rated health,
+household size and, as a sensitivity analysis only (it may not exist in every survey where the
+equations are applied), chronic disease. A model without socioeconomic variables (age + region)
+is also shown, because using education in the calibration and then estimating education
+inequalities is partly circular. All models are compared on the same sample.
+
+```{r candidates}
+dat <- dat %>% mutate(
+  saude3 = factor(case_when(saude %in% 1:2 ~ "Excellent/good", saude == 3 ~ "Fair",
+                            saude %in% 4:5 ~ "Poor/very poor"),
+                  levels = c("Excellent/good", "Fair", "Poor/very poor")),
+  ag_fam5 = factor(case_when(ag_fam %in% 1:4 ~ as.character(ag_fam),
+                             ag_fam >= 5 & ag_fam < 99 ~ "5+"),
+                   levels = c("1", "2", "3", "4", "5+")),
+  doenca_f = factor(doenca, levels = 0:1, labels = c("No", "Yes")),
+  cand_ok = cc & !is.na(saude3) & !is.na(ag_fam5) & !is.na(doenca_f))
+des_all <- make_design(dat)
+
+# "{v}" is replaced by peso / altura
+SPECS <- list(
+  `Final (age + region + education)` = c("idade", "region", "edu_rec"),
+  `No SEP (age + region)`            = c("idade", "region"),
+  `Final + non-linear terms`         = c("idade", "region", "edu_rec", "I(idade^2)",
+                                         "I({v}_rep^2)", "{v}_rep:idade"),
+  `Final + self-rated health`        = c("idade", "region", "edu_rec", "saude3"),
+  `Final + household size`           = c("idade", "region", "edu_rec", "ag_fam5"),
+  `Final + chronic disease (sens.)`  = c("idade", "region", "edu_rec", "doenca_f"))
+spec_formula <- function(v, covars)
+  as.formula(paste0(v, "_med ~ ", v, "_rep + ", gsub("{v}", v, paste(covars, collapse = " + "), fixed = TRUE)))
+added_terms <- function(v, spec) {
+  extra <- setdiff(SPECS[[spec]], SPECS[[1]])
+  if (length(extra) == 0) return(NULL)
+  as.formula(paste("~", gsub("{v}", v, paste(extra, collapse = " + "), fixed = TRUE)))
+}
+rmse_w <- function(m) sqrt(sum(m$prior.weights * residuals(m, type = "response")^2) / sum(m$prior.weights))
+
+# (a) In-sample fit of the height and weight equations
+cand_fit <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab], extra = dat$cand_ok)
+  bind_rows(lapply(c(weight = "peso", height = "altura"), function(v) {
+    bind_rows(lapply(names(SPECS), function(s) {
+      m <- svyglm(spec_formula(v, SPECS[[s]]), d)
+      at <- added_terms(v, s)
+      tibble(sex = lab, outcome = ifelse(v == "peso", "weight", "height"), model = s,
+             n = n_dom(d), rmse = rmse_w(m), aic = AIC(m)["AIC"],
+             p_added_terms = if (is.null(at)) NA_real_ else as.numeric(regTermTest(m, at)$p))
+    }))
+  }))
+})) %>% mutate(across(c(rmse, aic), ~ round(.x, 3)), p_added_terms = signif(p_added_terms, 3))
+cand_fit
+save_csv(cand_fit, "Calibration_candidate_predictors_fit")
+
+# (b) Repeated 70/30 validation of the resulting calibrated BMI
+validate_spec <- function(covars, seed) {
+  set.seed(seed)
+  d <- dat %>% filter(cand_ok)
+  d$split <- ifelse(runif(nrow(d)) < 0.7, "train", "test")
+  bind_rows(lapply(names(SEXES), function(lab) {
+    tr <- make_design(d %>% filter(sexo == SEXES[lab], split == "train"))
+    te <- d %>% filter(sexo == SEXES[lab], split == "test")
+    mw <- svyglm(spec_formula("peso", covars), tr)
+    mh <- svyglm(spec_formula("altura", covars), tr)
+    b <- predict(mw, newdata = te, type = "response") / (predict(mh, newdata = te, type = "response") / 100)^2
+    w <- te$ponderador1; ob_m <- te$bmi_med >= 30; ob_c <- b >= 30
+    tibble(sex = lab,
+           citl = weighted.mean(te$bmi_med - b, w),
+           slope = coef(lm(te$bmi_med ~ b, weights = w))[2],
+           mae = weighted.mean(abs(te$bmi_med - b), w),
+           rmse = sqrt(weighted.mean((te$bmi_med - b)^2, w)),
+           sens_obesity = sum(w[ob_m & ob_c]) / sum(w[ob_m]),
+           spec_obesity = sum(w[!ob_m & !ob_c]) / sum(w[!ob_m]),
+           prev_diff_obesity = 100 * (sum(w[ob_c]) - sum(w[ob_m])) / sum(w))
+  }))
+}
+cand_validation <- bind_rows(lapply(names(SPECS), function(s)
+  bind_rows(lapply(1:N_SPLITS, function(i) validate_spec(SPECS[[s]], i))) %>% mutate(model = s))) %>%
+  group_by(sex, model) %>%
+  summarise(across(citl:prev_diff_obesity, ~ sprintf("%.3f (%.3f; %.3f)", mean(.x),
+                                                    quantile(.x, .025), quantile(.x, .975))),
+            .groups = "drop") %>%
+  mutate(model = factor(model, levels = names(SPECS))) %>% arrange(sex, model)
+cand_validation
+save_csv(cand_validation, "Calibration_candidate_predictors_validation")
+```
+
+# 6. Agreement (Tables S10–S12)
+
+```{r agreement}
+# S10: weighted means
+tableS7 <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab])
+  m <- svymean(~ peso_med + peso_rep + peso_cal + altura_med + altura_rep + altura_cal +
+                 bmi_med + bmi_rep + bmi_cal, d, na.rm = TRUE)
+  tibble(sex = lab, variable = names(coef(m)), mean = round(coef(m), 2), se = round(SE(m), 2))
+}))
+save_csv(tableS7, "TableS7_means")
+
+# S12: cross-classification (row %), overall agreement and weighted kappa
+agree_tab <- function(design, cat_var) {
+  t <- svytable(as.formula(paste("~ bmi_med_cat +", cat_var)), design)
+  p <- prop.table(t)
+  po <- sum(diag(p)); pe <- sum(rowSums(p) * colSums(p))
+  wts <- 1 - abs(outer(1:3, 1:3, "-")) / 2                     # linear weights
+  pow <- sum(wts * p); pew <- sum(wts * outer(rowSums(p), colSums(p)))
+  list(row_pct = round(100 * prop.table(t, 1), 1), agreement = round(100 * po, 1),
+       kappa = round((po - pe) / (1 - pe), 3), kappa_w = round((pow - pew) / (1 - pew), 3))
+}
+tableS8 <- list()
+for (lab in names(SEXES)) {
+  d <- dom(des_all, SEXES[lab])
+  tableS8[[paste(lab, "self-reported")]] <- agree_tab(d, "bmi_rep_cat")
+  tableS8[[paste(lab, "calibrated")]]    <- agree_tab(d, "bmi_cal_cat")
+}
+tableS8
+tableS8_df <- bind_rows(lapply(names(tableS8), function(n) {
+  x <- as.data.frame(tableS8[[n]]$row_pct); names(x) <- c("measured", "comparison", "row_pct")
+  x %>% pivot_wider(names_from = comparison, values_from = row_pct) %>%
+    mutate(table = n, overall_agreement = tableS8[[n]]$agreement,
+           kappa = tableS8[[n]]$kappa, kappa_weighted = tableS8[[n]]$kappa_w, .before = 1)
+}))
+save_csv(tableS8_df, "TableS8_agreement")
+
+# S11: survey-weighted Lin's CCC with bootstrap (replicate-weight) CIs
+ccc_w <- function(x, y, w) {
+  W <- sum(w); mx <- sum(w * x) / W; my <- sum(w * y) / W
+  sx <- sum(w * (x - mx)^2) / W; sy <- sum(w * (y - my)^2) / W
+  sxy <- sum(w * (x - mx) * (y - my)) / W
+  2 * sxy / (sx + sy + (mx - my)^2)
+}
+tableS9 <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab])
+  rd <- as.svrepdesign(d, type = "subbootstrap", replicates = N_BOOT)
+  pairs <- list(weight_rep = c("peso_med", "peso_rep"), weight_cal = c("peso_med", "peso_cal"),
+                height_rep = c("altura_med", "altura_rep"), height_cal = c("altura_med", "altura_cal"),
+                bmi_rep = c("bmi_med", "bmi_rep"), bmi_cal = c("bmi_med", "bmi_cal"))
+  est <- withReplicates(rd, function(w, df) sapply(pairs, function(p) ccc_w(df[[p[1]]], df[[p[2]]], w)))
+  tibble(sex = lab, comparison = names(pairs), CCC = round(coef(est), 3),
+         ci_low = round(coef(est) - 1.96 * SE(est), 3), ci_high = round(coef(est) + 1.96 * SE(est), 3))
+}))
+tableS9
+save_csv(tableS9, "TableS9_CCC")
+```
+
+# 7. Prevalence by BMI method and tests (Table 2)
+
+```{r table3}
+table3 <- list(); table3_tests <- list()
+for (lab in names(SEXES)) {
+  d <- dom(des_all, SEXES[lab])
+  d <- update(d,
+    m_N = as.numeric(bmi_med_cat == "Normal"), m_P = as.numeric(bmi_med_cat == "Pre-obesity"),
+    m_O = as.numeric(bmi_med_cat == "Obesity"),
+    r_N = as.numeric(bmi_rep_cat == "Normal"), r_P = as.numeric(bmi_rep_cat == "Pre-obesity"),
+    r_O = as.numeric(bmi_rep_cat == "Obesity"),
+    c_N = as.numeric(bmi_cal_cat == "Normal"), c_P = as.numeric(bmi_cal_cat == "Pre-obesity"),
+    c_O = as.numeric(bmi_cal_cat == "Obesity"))
+  for (k in c(N = "Normal", P = "Pre-obesity", O = "Obesity")) {
+    kk <- names(which(c(N = "Normal", P = "Pre-obesity", O = "Obesity") == k))
+    est <- svymean(as.formula(paste0("~ m_", kk, " + r_", kk, " + c_", kk)), d)
+    dr <- svycontrast(est, setNames(c(-1, 1, 0), names(coef(est))))
+    dc <- svycontrast(est, setNames(c(-1, 0, 1), names(coef(est))))
+    ci <- function(x) sprintf("%.1f (%.1f to %.1f)", 100 * coef(x), 100 * (coef(x) - 1.96 * SE(x)),
+                              100 * (coef(x) + 1.96 * SE(x)))
+    table3[[paste(lab, k)]] <- tibble(
+      sex = lab, category = k,
+      measured = ci(svycontrast(est, setNames(c(1, 0, 0), names(coef(est))))),
+      self_reported = ci(svycontrast(est, setNames(c(0, 1, 0), names(coef(est))))),
+      calibrated = ci(svycontrast(est, setNames(c(0, 0, 1), names(coef(est))))),
+      diff_selfrep_vs_measured_pp = ci(dr), p_selfrep = signif(as.numeric(2 * pnorm(-abs(coef(dr) / SE(dr)))), 3),
+      diff_calibrated_vs_measured_pp = ci(dc), p_calibrated = signif(as.numeric(2 * pnorm(-abs(coef(dc) / SE(dc)))), 3))
+  }
+  # Overall test of marginal homogeneity (design-based Wald test, 2 df)
+  mh <- function(pref) {
+    est <- svymean(as.formula(paste0("~ I(", pref, "_N - m_N) + I(", pref, "_O - m_O)")), d)
+    b <- coef(est); V <- vcov(est); X2 <- as.numeric(t(b) %*% solve(V) %*% b)
+    dfd <- degf(d)
+    Fst <- X2 / 2
+    c(Wald_chi2 = X2, p_chi2 = pchisq(X2, 2, lower.tail = FALSE),
+      F = Fst, p_F = pf(Fst, 2, dfd, lower.tail = FALSE))
+  }
+  table3_tests[[lab]] <- bind_rows(
+    c(sex = lab, comparison = "self-reported vs measured", round(mh("r"), 4)),
+    c(sex = lab, comparison = "calibrated vs measured", round(mh("c"), 4)))
+}
+table3 <- bind_rows(table3); table3_tests <- bind_rows(table3_tests)
+table3; table3_tests
+save_csv(table3, "Table3_prevalence_and_differences")
+save_csv(table3_tests, "Table3_marginal_homogeneity_tests")
+```
+
+# 8. Socioeconomic inequalities in obesity (Table 3)
+
+PD/PR: low vs high (extreme categories, high = reference); employment: unemployed
+vs employed. SII/RII: sex-specific weighted ridit scores (0 = most advantaged).
+Employment in SII/RII uses the same two groups (employed, unemployed); the
+"other" employment situation is excluded from the employment contrasts.
+
+```{r inequalities}
+dat <- dat %>% mutate(
+  ob_med = as.numeric(bmi_med >= 30), ob_rep = as.numeric(bmi_rep >= 30),
+  ob_cal = as.numeric(bmi_cal >= 30),
+  emp2 = factor(case_when(trab == "Employed" ~ "High", trab == "Unemployed" ~ "Low"),
+                levels = c("High", "Low")))
+des_all <- make_design(dat)
+SEP <- c(Education = "edu_rec", Income = "rend_rec", Employment = "emp2")
+OUT <- c(Measured = "ob_med", `Self-reported` = "ob_rep", Calibrated = "ob_cal")
+
+ridit <- function(x, w) {           # x ordered High -> Low, returns ridit per observation
+  tw <- tapply(w, x, sum); tw <- tw[!is.na(tw)]
+  cum <- cumsum(tw) / sum(tw); r <- cum - (tw / sum(tw)) / 2
+  unname(r[as.character(x)])
+}
+
+# Point estimates and CIs with svyglm (as in the manuscript)
+ineq_fits <- function(design, y, sep) {
+  x <- design$variables[[sep]]
+  design <- setvar(design, ".ext", x %in% c("High", "Low"))
+  design <- setvar(design, ".low", as.numeric(x == "Low"))
+  design <- setvar(design, ".rid", design$variables[[paste0(sep, "_rid")]])
+  dd <- subset(design, .ext)
+  list(PD = svyglm(as.formula(paste(y, "~ .low")), dd),
+       logPR = svyglm(as.formula(paste(y, "~ .low")), dd, family = quasipoisson(link = "log")),
+       SII = svyglm(as.formula(paste(y, "~ .rid")), design),
+       logRII = svyglm(as.formula(paste(y, "~ .rid")), design, family = quasipoisson(link = "log")))
+}
+ineq_svy <- function(design, y, sep) {
+  fits <- ineq_fits(design, y, sep)
+  pd <- fits$PD; pr <- fits$logPR; sii <- fits$SII; rii <- fits$logRII
+  f <- function(m, expo, scale) {
+    b <- coef(m)[2]; s <- SE(m)[2]
+    if (expo) sprintf("%.2f (%.2f–%.2f)", exp(b), exp(b - 1.96 * s), exp(b + 1.96 * s))
+    else sprintf("%.1f (%.1f to %.1f)", scale * b, scale * (b - 1.96 * s), scale * (b + 1.96 * s))
+  }
+  c(PD = f(pd, FALSE, 100), PR = f(pr, TRUE), SII = f(sii, FALSE, 100), RII = f(rii, TRUE))
+}
+
+# Fast weighted estimates for bootstrap replicates (differences between methods)
+ineq_fast <- function(df, w, y, sep) {
+  i <- !is.na(df[[sep]]) & !is.na(df[[y]])
+  x <- df[[sep]][i]; yy <- df[[y]][i]; ww <- w[i]
+  hi <- x == "High"; lo <- x == "Low"
+  p_hi <- sum(ww[hi] * yy[hi]) / sum(ww[hi]); p_lo <- sum(ww[lo] * yy[lo]) / sum(ww[lo])
+  r <- ridit(x, ww)
+  sii <- coef(lm.wfit(cbind(1, r), yy, ww))[2]
+  rii <- coef(suppressWarnings(glm.fit(cbind(1, r), yy, weights = ww,
+                                       family = quasipoisson(link = "log"))))[2]
+  c(PD = 100 * (p_lo - p_hi), logPR = log(p_lo / p_hi), SII = 100 * sii, logRII = rii)
+}
+
+table4 <- list(); table4_diff <- list()
+for (lab in names(SEXES)) {
+  d <- dom(des_all, SEXES[lab])
+  dv <- d$variables
+  for (s in SEP) dv[[paste0(s, "_rid")]] <- ridit(dv[[s]], dv$ponderador1)
+  d$variables <- dv
+  for (sl in names(SEP)) for (ol in names(OUT))
+    table4[[paste(lab, sl, ol)]] <- c(sex = lab, SEP = sl, BMI = ol, ineq_svy(d, OUT[[ol]], SEP[[sl]]))
+
+  # Bootstrap: SE and CI of the difference (self-reported − measured; calibrated − measured)
+  rd <- as.svrepdesign(d, type = "subbootstrap", replicates = N_BOOT)
+  stat_fun <- function(w, df) {
+    unlist(lapply(names(SEP), function(sl) {
+      m <- ineq_fast(df, w, "ob_med", SEP[[sl]])
+      r <- ineq_fast(df, w, "ob_rep", SEP[[sl]])
+      cc <- ineq_fast(df, w, "ob_cal", SEP[[sl]])
+      setNames(c(r - m, cc - m),
+               c(paste(sl, "SR-M", names(m)), paste(sl, "Cal-M", names(m))))
+    }))
+  }
+  bt <- withReplicates(rd, stat_fun)
+  table4_diff[[lab]] <- tibble(sex = lab, contrast = names(coef(bt)),
+                               diff = coef(bt), se = SE(bt)) %>%
+    mutate(ci_low = diff - 1.96 * se, ci_high = diff + 1.96 * se,
+           p = 2 * pnorm(-abs(diff / se)),
+           # PR and RII differences are on the log scale: report the ratio of ratios
+           ratio_of_ratios = ifelse(grepl("log", contrast), exp(diff), NA),
+           ror_ci_low = ifelse(grepl("log", contrast), exp(ci_low), NA),
+           ror_ci_high = ifelse(grepl("log", contrast), exp(ci_high), NA))
+}
+table4 <- bind_rows(lapply(table4, function(x) as_tibble(as.list(x))))
+table4_diff <- bind_rows(table4_diff) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+table4
+table4_diff
+save_csv(table4, "Table4_inequalities")
+save_csv(table4_diff, "Table4_differences_between_methods_bootstrap")
+```
+
+# 9. Sensitivity: excluding large self-report discrepancies
+
+```{r sensitivity-discrepancy}
+sens <- bind_rows(lapply(names(SEXES), function(lab) {
+  d <- dom(des_all, SEXES[lab], extra = !dat$big_discrepancy)
+  m <- svymean(~ ob_med + ob_rep + ob_cal, d, na.rm = TRUE)
+  tibble(sex = lab, n = n_dom(d), measure = names(coef(m)), prevalence = round(100 * coef(m), 1))
+}))
+sens
+save_csv(sens, "Sensitivity_excluding_large_discrepancies")
+```
+
+# 9b. Associations with health indicators (Table 4)
+
+Associations of obesity (and BMI per 1 kg/m²) with chronic disease, fair/poor self-rated
+health and measured abdominal obesity, by BMI method: survey-weighted Poisson regression
+(prevalence ratios) adjusted for age and region, by sex. Differences between methods are
+ratios of prevalence ratios (self-reported or calibrated / measured) with bootstrap CIs.
+
+```{r health-associations}
+dat <- dat %>% mutate(
+  ob_med = as.numeric(bmi_med >= 30), ob_rep = as.numeric(bmi_rep >= 30),
+  ob_cal = as.numeric(bmi_cal >= 30),
+  chronic  = ifelse(doenca %in% 0:1, doenca, NA),                        # any chronic disease (self-reported)
+  srh      = ifelse(saude %in% 1:5, saude, NA),                           # self-rated health score, 1 = excellent ... 5 = very poor; 8 = NA
+  waist    = ifelse(is.na(cint_med) | cint_med > 200, NA, cint_med))   # measured waist circumference (cm)
+des_all <- make_design(dat)
+HEALTH <- c(`Chronic disease` = "chronic",
+            `Self-rated health score (1-5)` = "srh",
+            `Waist circumference (cm)` = "waist")
+EXPO <- list(Measured = c("ob_med", "bmi_med"), `Self-reported` = c("ob_rep", "bmi_rep"),
+             Calibrated = c("ob_cal", "bmi_cal"))
+ADJ <- "idade + region"
+
+CONTINUOUS <- c("srh", "waist")   # linear regression (mean difference); binary outcomes: Poisson (prevalence ratio)
+fam <- function(y) if (y %in% CONTINUOUS) gaussian() else quasipoisson(link = "log")
+# survey-weighted regression: PR (or mean difference) for obesity and per 1 kg/m2 BMI
+health_pr <- function(d, y, x) {
+  m <- svyglm(as.formula(paste(y, "~", x, "+", ADJ)), d, family = fam(y))
+  b <- coef(m)[x]; s <- SE(m)[x]
+  if (y %in% CONTINUOUS) sprintf("%.2f (%.2f to %.2f)", b, b - 1.96 * s, b + 1.96 * s)
+  else sprintf("%.2f (%.2f–%.2f)", exp(b), exp(b - 1.96 * s), exp(b + 1.96 * s))
+}
+health_fast <- function(df, w, y, x) {
+  i <- !is.na(df[[y]]); X <- model.matrix(as.formula(paste("~", x, "+", ADJ)), df[i, ])
+  coef(suppressWarnings(glm.fit(X, df[[y]][i], weights = w[i], family = fam(y))))[2]
+}
+tableS13 <- list(); tableS13_diff <- list()
+for (lab in names(SEXES)) for (hl in names(HEALTH)) {
+  y <- HEALTH[[hl]]
+  d <- dom(des_all, SEXES[lab], extra = !is.na(dat[[y]]))
+  prev <- svymean(as.formula(paste0("~", y)), d)
+  row <- c(sex = lab, outcome = hl, n = n_dom(d), prevalence = if (y %in% CONTINUOUS) sprintf("mean %.1f", coef(prev)) else sprintf("%.1f", 100 * coef(prev)))
+  for (ml in names(EXPO)) {
+    row[paste(ml, "obesity")] <- health_pr(d, y, EXPO[[ml]][1])
+    row[paste(ml, "BMI per kg/m2")] <- health_pr(d, y, EXPO[[ml]][2])
+  }
+  tableS13[[paste(lab, hl)]] <- row
+  # bootstrap: ratio of PRs (self-reported / measured; calibrated / measured); difference of mean differences for SRH score
+  rd <- as.svrepdesign(d, type = "subbootstrap", replicates = N_BOOT)
+  stat_fun <- function(w, df) {
+    keep <- w > 0
+    unlist(lapply(c(obesity = 1, BMI = 2), function(k) {
+      m <- health_fast(df[keep, ], w[keep], y, EXPO$Measured[k])
+      c(`SR/M` = health_fast(df[keep, ], w[keep], y, EXPO$`Self-reported`[k]) - m,
+        `Cal/M` = health_fast(df[keep, ], w[keep], y, EXPO$Calibrated[k]) - m)
+    }))
+  }
+  bt <- withReplicates(rd, stat_fun)
+  tr <- if (y %in% CONTINUOUS) identity else exp
+  tableS13_diff[[paste(lab, hl)]] <- tibble(sex = lab, outcome = hl, contrast = names(coef(bt)),
+    ratio_or_diff = tr(coef(bt)), ci_low = tr(coef(bt) - 1.96 * SE(bt)), ci_high = tr(coef(bt) + 1.96 * SE(bt)),
+    p = 2 * pnorm(-abs(coef(bt) / SE(bt))))
+}
+tableS13 <- bind_rows(lapply(tableS13, function(x) as_tibble(as.list(x))))
+tableS13_diff <- bind_rows(tableS13_diff) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+tableS13
+tableS13_diff
+save_csv(tableS13, "TableS13_health_associations")
+save_csv(tableS13_diff, "TableS13_ratio_of_PR_bootstrap")
+
+# ---- Table S14: prevalence (or mean) of health indicators by obesity status, BMI method and sex
+dat <- dat %>% mutate(srh5 = factor(c("Excellent", "Good", "Fair", "Poor", "Very poor")[ifelse(saude %in% 1:5, saude, NA)],
+                                     levels = c("Excellent", "Good", "Fair", "Poor", "Very poor")))
+des_all <- make_design(dat)
+OUTC <- list(`Chronic disease` = "chronic", `Self-rated health` = "srh5",
+             `Waist circumference (cm), mean` = "waist")
+fmt_p <- function(m, s) sprintf("%.1f (%.1f–%.1f)", 100 * m, 100 * pmax(m - 1.96 * s, 0), 100 * pmin(m + 1.96 * s, 1))
+prev_health <- list()
+for (lab in names(SEXES)) for (ol in names(OUTC)) {
+  y <- OUTC[[ol]]
+  d <- dom(des_all, SEXES[lab], extra = !is.na(dat[[y]]))
+  for (meth in names(EXPO)) {
+    x <- EXPO[[meth]][1]
+    for (ob in 0:1) {
+      dd <- subset(d, get(x) == ob)
+      est <- svymean(as.formula(paste0("~", y)), dd, na.rm = TRUE)
+      m <- coef(est); s <- SE(est)
+      lev <- if (y == "srh5") sub("srh5", "", names(m)) else if (y == "waist") "Mean" else "Yes"
+      if (y != "srh5") { m <- m[1]; s <- s[1] }
+      prev_health[[length(prev_health) + 1]] <- tibble(sex = lab, outcome = ol, category = lev, method = meth,
+        obesity = ifelse(ob == 1, "Obesity", "No obesity"), n = sum(dd$variables[[x]] == ob, na.rm = TRUE),
+        prev = if (y == "waist") sprintf("%.1f (%.1f–%.1f)", m, m - 1.96 * s, m + 1.96 * s) else fmt_p(m, s))
+    }
+  }
+}
+prev_health <- bind_rows(prev_health) %>%
+  tidyr::pivot_wider(id_cols = c(sex, outcome, category), names_from = c(method, obesity),
+                     values_from = prev, names_sep = ": ")
+print(prev_health, width = Inf)
+save_csv(prev_health, "TableS13_health_prevalence_by_obesity_method")
+```
+
+# 10. Multiple imputation (Table S2)
+
+```{r mice}
+mi_base <- dat %>% filter(plausible) %>%
+  select(sexo, idade, region, psu2, nut2, ponderador1, edu_rec, rend_rec, trab,
+         peso_med, altura_med, peso_rep, altura_rep) %>%
+  mutate(edu_rec = factor(edu_rec, ordered = TRUE), rend_rec = factor(rend_rec, ordered = TRUE),
+         bmi_med = peso_med / (altura_med / 100)^2)
+meth <- make.method(mi_base)
+meth[] <- ""
+meth[c("edu_rec", "rend_rec")] <- "polr"
+meth["trab"] <- "polyreg"
+pred <- make.predictorMatrix(mi_base)
+pred[, c("psu2", "nut2")] <- 0          # design identifiers are not used as predictors (region is)
+imp <- mice(mi_base, m = N_IMP, method = meth, predictorMatrix = pred, printFlag = FALSE, seed = 123)
+
+mi_one <- function(df) {
+  df <- df %>% mutate(edu_rec = factor(edu_rec, ordered = FALSE, levels = c("High", "Intermediate", "Low")),
+                      rend_rec = factor(rend_rec, ordered = FALSE, levels = c("High", "Intermediate", "Low")),
+                      bmi_rep = peso_rep / (altura_rep / 100)^2, cc = TRUE)
+  # re-estimate the calibration equations in each imputed dataset
+  dsg <- make_design(df)
+  mods <- lapply(SEXES, function(s) {
+    ds <- subset(dsg, sexo == s)
+    list(weight = svyglm(as.formula(paste("peso_med ~ peso_rep +", paste(FINAL_COVARS, collapse = " + "))), ds),
+         height = svyglm(as.formula(paste("altura_med ~ altura_rep +", paste(FINAL_COVARS, collapse = " + "))), ds))
+  })
+  df <- apply_calibration(df, mods) %>%
+    mutate(ob_med = as.numeric(bmi_med >= 30), ob_rep = as.numeric(bmi_rep >= 30),
+           ob_cal = as.numeric(bmi_cal >= 30),
+           emp2 = factor(case_when(trab == "Employed" ~ "High", trab == "Unemployed" ~ "Low"),
+                         levels = c("High", "Low")))
+  res <- list()
+  for (lab in names(SEXES)) {
+    dd <- df %>% filter(sexo == SEXES[lab])
+    for (s in SEP) dd[[paste0(s, "_rid")]] <- ridit(dd[[s]], dd$ponderador1)
+    dsx <- make_design(dd)
+    for (sl in names(SEP)) for (ol in names(OUT)) {
+      fits <- ineq_fits(dsx, OUT[[ol]], SEP[[sl]])
+      for (ms in names(fits)) res[[length(res) + 1]] <- tibble(
+        sex = lab, SEP = sl, BMI = ol, measure = ms,
+        est = coef(fits[[ms]])[2], se = SE(fits[[ms]])[2])
+    }
+  }
+  bind_rows(res)
+}
+mi_res <- bind_rows(lapply(1:N_IMP, function(i) mi_one(complete(imp, i)) %>% mutate(imp = i)))
+tableS10 <- mi_res %>%
+  group_by(sex, SEP, BMI, measure) %>%
+  summarise(q = mean(est), u = mean(se^2), b = var(est), .groups = "drop") %>%
+  mutate(se = sqrt(u + (1 + 1 / N_IMP) * b),
+         value = case_when(
+           measure %in% c("logPR", "logRII") ~ sprintf("%.2f (%.2f–%.2f)", exp(q), exp(q - 1.96 * se), exp(q + 1.96 * se)),
+           TRUE ~ sprintf("%.1f (%.1f to %.1f)", 100 * q, 100 * (q - 1.96 * se), 100 * (q + 1.96 * se))),
+         measure = sub("log", "", measure)) %>%
+  select(sex, SEP, BMI, measure, value) %>%
+  pivot_wider(names_from = measure, values_from = value)
+tableS10
+save_csv(tableS10, "TableS10_multiple_imputation")
+```
+
+# 11. Tables (shown here and exported to Word)
+
+All tables are collected in `TABLES`; the same list is printed below as formatted tables
+and written to `outputs/paper5_clean_results.docx`.
+
+```{r collect-tables}
+r3 <- function(df) as.data.frame(df) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+TABLES <- list(
+  "Flow of participants" = flow,
+  "Table S13. Weighted characteristics" = table1,
+  "Table S1. Complete vs incomplete cases" = tableS1,
+  "Bland-Altman (weighted)" = ba,
+  "Tables S4-S5. Mean reporting bias by group" = tableS4_S5,
+  "Calibration: backward selection (result)" = sel_summary,
+  "Calibration: backward selection (steps)" = sel_table,
+  "Table S9. Calibration coefficients" = tableS6,
+  "Calibration: extra predictors check" = extra_check,
+  "Internal validation (70/30)" = r3(validation_main),
+  "Internal validation, repeated 70/30 splits" = r3(validation_rep),
+  "Calibration: candidate predictors, in-sample fit" = cand_fit,
+  "Calibration: candidate predictors, repeated 70/30 validation (mean, 2.5th; 97.5th pct)" = cand_validation,
+  "Table S10. Weighted means" = tableS7,
+  "Table S12. Cross-classification (row %), agreement and kappa" = tableS8_df,
+  "Table S11. Lin's CCC (weighted, bootstrap 95% CI)" = tableS9,
+  "Table 2. Prevalence by BMI method and differences vs measured" = table3,
+  "Table 2. Tests of marginal homogeneity" = table3_tests,
+  "Table 3. Socioeconomic inequalities in obesity" = table4,
+  "Table 3b. Differences between BMI methods (bootstrap)" = table4_diff,
+  "Sensitivity: excluding large discrepancies" = sens,
+  "Table S2. Multiple imputation" = tableS10,
+  "Table 4. Associations with health indicators (PR or mean difference, 95% CI)" = tableS13,
+  "Table 4b. Ratio of PRs / difference vs measured BMI (bootstrap)" = tableS13_diff,
+  "Table S14. Prevalence or mean of health indicators by obesity status" = prev_health)
+if (exists("table2", inherits = FALSE) && is.data.frame(table2))
+  TABLES[["Table 1. Determinants of misreporting"]] <- table2 %>%
+    select(sex, outcome, comparison, term, `OR (95% CI)`)
+if (exists("tableS3", inherits = FALSE) && is.data.frame(tableS3))
+  TABLES[["Table S6. Determinants of misreporting (1 cm / 2 kg cut-offs)"]] <- tableS3
+TABLES <- TABLES[sapply(TABLES, function(x) is.data.frame(x) && nrow(x) > 0)]
+
+make_ft <- function(df) flextable(as.data.frame(df)) %>% theme_booktabs() %>%
+  fontsize(size = 8, part = "all") %>% autofit()
+```
+
+```{r show-tables, results = "asis"}
+for (nm in names(TABLES)) {
+  cat("\n\n### ", nm, "\n\n", sep = "")
+  cat(knitr::knit_print(make_ft(TABLES[[nm]])))
+}
+```
+
+```{r export}
+doc <- read_docx()
+for (nm in names(TABLES)) {
+  doc <- doc %>% body_add_par(nm, style = "heading 2") %>%
+    body_add_flextable(make_ft(TABLES[[nm]])) %>% body_add_par("")
+}
+print(doc, target = file.path(OUT_DIR, "paper5_clean_results.docx"))
+sessionInfo()
+```
